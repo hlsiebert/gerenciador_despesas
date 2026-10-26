@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.routes import get_repository
+from app.api import routes as despesas_routes
 from app.main import app
 from app.repositories.despesas_repository import DespesaRepository
 
@@ -25,15 +25,12 @@ def repository(database_path: Path) -> DespesaRepository:
 
 
 @pytest.fixture
-def client(repository: DespesaRepository) -> Iterator[TestClient]:
-    previous_overrides = app.dependency_overrides.copy()
-    app.dependency_overrides[get_repository] = lambda: repository
-    try:
-        with TestClient(app) as test_client:
-            yield test_client
-    finally:
-        app.dependency_overrides.clear()
-        app.dependency_overrides.update(previous_overrides)
+def client(
+    repository: DespesaRepository, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    monkeypatch.setattr(despesas_routes, "_repository", repository)
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 def buscar_registro(database_path: Path, despesa_id: str) -> tuple[str, ...] | None:
@@ -294,29 +291,33 @@ def test_id_com_formato_invalido_retorna_422(
 
 def test_falha_de_banco_no_cadastro_retorna_erro_500_sem_expor_detalhes(
     repository: DespesaRepository,
+    database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    previous_overrides = app.dependency_overrides.copy()
-    app.dependency_overrides[get_repository] = lambda: repository
+    monkeypatch.setattr(despesas_routes, "_repository", repository)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER falhar_insert_despesas
+            BEFORE INSERT ON despesas
+            BEGIN
+                SELECT RAISE(ABORT, 'detalhe interno do banco');
+            END;
+            """
+        )
 
-    def falhar_create(payload: object) -> None:
-        raise sqlite3.OperationalError("detalhe interno do banco")
-
-    repository.create = falhar_create  # type: ignore[method-assign]
-    try:
-        with TestClient(app, raise_server_exceptions=False) as test_client:
-            response = test_client.post(
-                "/despesas",
-                json={
-                    "descricao": "Conta de energia",
-                    "valor": "125.50",
-                    "data_transacao": "2026-05-10",
-                    "categoria": "moradia",
-                    "forma_pagamento": "debito",
-                },
-            )
-    finally:
-        app.dependency_overrides.clear()
-        app.dependency_overrides.update(previous_overrides)
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        response = test_client.post(
+            "/despesas",
+            json={
+                "descricao": "Conta de energia",
+                "valor": "125.50",
+                "data_transacao": "2026-05-10",
+                "categoria": "moradia",
+                "forma_pagamento": "debito",
+            },
+        )
 
     assert response.status_code == 500
     assert "detalhe interno do banco" not in response.text
+    assert repository.count() == 0
